@@ -89,7 +89,7 @@ def augmented_dynamics(t, s, args):
     _, vjp_fun = jax.vjp(lambda theta: model_forward(z, theta), params)
     d3 = vjp_fun(a)[0]
     d3 = jnp.tile(d3, (batch_size, 1)) / batch_size
-    ds = jnp.concatenate((d1, d2, d3), axis=1)
+    ds = jnp.concatenate((d1, -d2, -d3), axis=1)
     return ds
 
 
@@ -115,7 +115,7 @@ def step(params, opt_state, y0, y):
     y1 = y[-1, :, :]
     loss, loss_grads = compute_loss(y_pred, y1)
     input_grads, parameter_grads = backward(params, y_pred, loss_grads)
-    updates, opt_state = optimizer.update(-parameter_grads, opt_state)
+    updates, opt_state = optimizer.update(parameter_grads, opt_state)
     params = optax.apply_updates(params, updates)
     return loss, params, opt_state
 

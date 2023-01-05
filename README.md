@@ -1,7 +1,7 @@
 # Neural Differential Equations
 
-JAX implementations of various neural differential equation architectures from scratch.
-Diffrax is used for handling the numerical integration.
+[JAX](https://github.com/google/jax) implementations of various neural differential equation architectures from scratch.
+[Diffrax](https://github.com/patrick-kidger/diffrax) is used for handling the numerical integration.
 
 ## Neural Ordinary Differential Equations
 
