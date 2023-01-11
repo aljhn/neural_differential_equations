@@ -52,7 +52,7 @@ key, subkey = jax.random.split(key)
 model_def = [2, 50, 50, 2]
 params = model_init(model_def, subkey)
 
-optimizer = optax.adamw(learning_rate=1e-3)
+optimizer = optax.adamw(learning_rate=1e-2)
 opt_state = optimizer.init(params)
 
 
@@ -86,15 +86,14 @@ model_term = ODETerm(lambda t, y, args: model_forward(y, args[0]))
 
 
 @jax.value_and_grad
-def compute_loss(y_pred, y):
-    return jnp.mean(optax.l2_loss(y_pred, y))
+def compute_loss(y_pred, y_true):
+    return jnp.mean(optax.l2_loss(y_pred, y_true))
 
 
 # Neural ODE forward pass
 def forward(y0, params):
     solution = diffeqsolve(model_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, args=[params], adjoint=NoAdjoint())
-    y_pred = solution.ys[-1, :, :]
-    return y_pred
+    return solution.ys[-1, :, :]
 
 
 # Dynamics being integrated backwards in time to compute the gradients in the backward pass
@@ -108,10 +107,15 @@ def augmented_dynamics(t, s, args):
 
     batch_size = s.shape[0]
 
-    d1, d2 = jax.jvp(lambda x: model_forward(x, params), (z,), (a,))
+    # _, vjp_fun = jax.vjp(lambda theta: model_forward(z, theta), params)
+    # d3 = vjp_fun(a)[0]
+    # d3 = jnp.tile(d3, (batch_size, 1)) / batch_size
 
-    _, vjp_fun = jax.vjp(lambda theta: model_forward(z, theta), params)
-    d3 = vjp_fun(a)[0]
+    # theta = jnp.tile(params, (batch_size, 1))
+
+    # d1, vjp_fun = jax.vjp(lambda z, theta: jax.vmap(model_forward)(z, theta), z, theta)
+    d1, vjp_fun = jax.vjp(model_forward, z, params)
+    d2, d3 = vjp_fun(a)
     d3 = jnp.tile(d3, (batch_size, 1)) / batch_size
     ds = jnp.concatenate((d1, -d2, -d3), axis=1)
     return ds
@@ -122,6 +126,7 @@ augmented_term = ODETerm(augmented_dynamics)
 
 # Neural ODE backward pass
 # Returns gradients from the output of the Neural ODE to both the parameters and the input
+# Algorithm 1 from https://arxiv.org/abs/1806.07366
 def backward(params, z_pred, output_grads):
     batch_size, n = z_pred.shape
     z1 = z_pred
@@ -130,8 +135,8 @@ def backward(params, z_pred, output_grads):
     s0 = jnp.concatenate((z1, a1, dL), axis=1)
     solution = diffeqsolve(augmented_term, solver, t0=T1, t1=T0, dt0=-h, y0=s0, args=[params], adjoint=NoAdjoint())
     augmented_state = solution.ys[-1, :, :]
-    input_grads = jnp.mean(augmented_state[:, n:2*n], axis=0)
-    parameter_grads = jnp.mean(augmented_state[:, -params.shape[0]:], axis=0)
+    input_grads = jnp.mean(augmented_state[:, n:2 * n], axis=0)
+    parameter_grads = jnp.mean(augmented_state[:, 2 * n:], axis=0)
     return input_grads, parameter_grads
 
 
@@ -148,12 +153,16 @@ def train(params, opt_state, y):
     return loss, params, opt_state
 
 
+def validation_loss(y_pred, y_true):
+    return jnp.mean(optax.l2_loss(y_pred, y_true))
+
+
 @jax.jit
 def validate(params, y):
     y0 = y[0, :, :]
     y_pred = forward(y0, params)
     y1 = y[-1, :, :]
-    loss, loss_grads = compute_loss(y_pred, y1)
+    loss = validation_loss(y_pred, y1)
     return loss
 
 
@@ -166,14 +175,17 @@ def data_split(y, ratio=0.8):
 
 epochs = 100
 for epoch in range(1, epochs + 1):
-    key, subkey = jax.random.split(key)
-    y = generate_data(data_term, dim, batch_size, subkey, T0, T1, h, saveat, solver)
-    y_train, y_val = data_split(y)
+    try:
+        key, subkey = jax.random.split(key)
+        y = generate_data(data_term, dim, batch_size, subkey, T0, T1, h, saveat, solver)
+        y_train, y_val = data_split(y)
 
-    train_loss, params, opt_state = train(params, opt_state, y_train)
-    val_loss = validate(params, y_val)
+        train_loss, params, opt_state = train(params, opt_state, y_train)
+        val_loss = validate(params, y_val)
 
-    print(f"Epoch: {epoch:3d}, Train Loss: {train_loss.item():.4f}, Val Loss: {val_loss.item():.4f}")
+        print(f"Epoch: {epoch:3d}, Train Loss: {train_loss.item():.4f}, Val Loss: {val_loss.item():.4f}")
+    except KeyboardInterrupt:
+        break
 
 
 def plot_vector_field(params):
@@ -206,4 +218,4 @@ def plot_vector_field(params):
     plt.streamplot(X1, X2, Y1, Y2, density=1, linewidth=None, color="#A23BEC")
     plt.show()
 
-plot_vector_field(params)
+# plot_vector_field(params)
