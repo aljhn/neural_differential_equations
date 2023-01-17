@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import jax
 import jax.numpy as jnp
+import jax.tree_util as jtu
 import optax
 from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt, NoAdjoint
 
@@ -39,13 +40,16 @@ batch_size = 200
 
 
 # Define models as a list of nodes per layer
-# Return the parameters as a single one-dimensional vector
+# Return the parameters as a list of dictionaries containing arrays
 def model_init(model_def, key):
-    parameter_count = 0
+    subkeys = jax.random.split(key, num=(len(model_def) - 1) * 2)
+    params = []
     for i in range(len(model_def) - 1):
-        parameter_count += model_def[i] * model_def[i + 1] + model_def[i + 1]
-
-    params = jax.random.normal(key, (parameter_count,))
+        layer = {
+            "weights": jax.random.normal(subkeys[i], (model_def[i], model_def[i + 1])),
+            "bias": jax.random.normal(subkeys[i + len(model_def) - 1], (model_def[i + 1],))
+        }
+        params.append(layer)
     return params
 
 
@@ -53,7 +57,8 @@ key, subkey = jax.random.split(key)
 model_def = [2, 50, 50, 2]
 params = model_init(model_def, subkey)
 
-optimizer = optax.adamw(learning_rate=1e-3)
+
+optimizer = optax.adamw(learning_rate=1e-2)
 opt_state = optimizer.init(params)
 
 
@@ -61,64 +66,33 @@ opt_state = optimizer.init(params)
 # The forward pass is computed as a standard fully connected neural network
 # The sigmoid activation function is applied at every layer except the last
 def model_forward(x, params):
-    param_index = 0
     for i in range(len(model_def) - 1):
-        layer_index = model_def[i] * model_def[i + 1]
-        weights = params[param_index:param_index + layer_index]
-        weights = jnp.reshape(weights, (model_def[i], model_def[i + 1]))
-
-        param_index += layer_index
-        layer_index = model_def[i + 1]
-        bias = params[param_index:param_index + layer_index]
-
-        param_index += layer_index
-
+        weights = params[i]["weights"]
+        bias = params[i]["bias"]
         x = x @ weights + bias
         if i < len(model_def) - 1:
             x = jax.nn.sigmoid(x)
     return x
 
 
-# Vectorize the forward pass using vmap
-# Can not use a decorator because the in_axes must be specified
-model_forward = jax.vmap(model_forward, in_axes=(0, None))
-
 model_term = ODETerm(lambda t, y, args: model_forward(y, args))
     
-
-@jax.value_and_grad
-def compute_loss(y_pred, y_true):
-    return jnp.mean(optax.l2_loss(y_pred, y_true))
-
 
 # Neural ODE forward pass
 def forward(y0, params):
     solution = diffeqsolve(model_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, args=params, adjoint=NoAdjoint())
-    return solution.ys[-1, :, :]
+    return solution.ys
 
 
 # Dynamics being integrated backwards in time to compute the gradients in the backward pass
-# The final vector-jacobian-product is currently not vectorized properly,
-# which is (inefficiently) solved by duplicating and averaging the result
-def augmented_dynamics(t, s, args):
-    params = args
-    n = (s.shape[1] - params.shape[0]) // 2
-    z = s[:, 0:n]
-    a = s[:, n:2*n]
-
-    batch_size = s.shape[0]
-
-    # _, vjp_fun = jax.vjp(lambda theta: model_forward(z, theta), params)
-    # d3 = vjp_fun(a)[0]
-    # d3 = jnp.tile(d3, (batch_size, 1)) / batch_size
-
-    # theta = jnp.tile(params, (batch_size, 1))
-
-    # d1, vjp_fun = jax.vjp(lambda z, theta: jax.vmap(model_forward)(z, theta), z, theta)
+# Computed efficiently with a reverse-mode vector-jacobian product
+def augmented_dynamics(t, s, params):
+    z, a, _ = s
     d1, vjp_fun = jax.vjp(model_forward, z, params)
     d2, d3 = vjp_fun(a)
-    d3 = jnp.tile(d3, (batch_size, 1)) / batch_size
-    ds = jnp.concatenate((d1, -d2, -d3), axis=1)
+    d2 = -d2
+    d3 = jtu.tree_map(lambda x: -x, d3)
+    ds = (d1, d2, d3)
     return ds
 
 
@@ -129,26 +103,33 @@ augmented_term = ODETerm(augmented_dynamics)
 # Returns gradients from the output of the Neural ODE to both the parameters and the input
 # Algorithm 1 from https://arxiv.org/abs/1806.07366
 def backward(params, z_pred, output_grads):
-    batch_size, n = z_pred.shape
     z1 = z_pred
     a1 = output_grads
-    dL = jnp.zeros((batch_size, params.shape[0]))
-    s0 = jnp.concatenate((z1, a1, dL), axis=1)
-    solution = diffeqsolve(augmented_term, solver, t0=T1, t1=T0, dt0=-h, y0=s0, args=params, adjoint=NoAdjoint())
-    augmented_state = solution.ys[-1, :, :]
-    input_grads = jnp.mean(augmented_state[:, n:2 * n], axis=0)
-    parameter_grads = jnp.mean(augmented_state[:, 2 * n:], axis=0)
+    dL = jtu.tree_map(lambda x: jnp.zeros_like(x), params)
+    s1 = (z1, a1, dL)
+    solution = diffeqsolve(augmented_term, solver, t0=T1, t1=T0, dt0=-h, y0=s1, args=params, adjoint=NoAdjoint())
+    z0, input_grads, parameter_grads = solution.ys
+    input_grads = input_grads[0, :]
+    parameter_grads = jtu.tree_map(lambda x: jnp.squeeze(x), parameter_grads)
     return input_grads, parameter_grads
+
+
+@jax.value_and_grad
+def compute_loss(y_pred, y_true):
+    return jnp.mean(optax.l2_loss(y_pred, y_true))
 
 
 # One step of the training algorithm
 @jax.jit
 def train(params, opt_state, y):
     y0 = y[0, :, :]
-    y_pred = forward(y0, params)
+    y_pred = jax.vmap(forward, in_axes=(0, None))(y0, params)
+    y_pred = jnp.squeeze(y_pred)
     y1 = y[-1, :, :]
     loss, loss_grads = compute_loss(y_pred, y1)
-    input_grads, parameter_grads = backward(params, y_pred, loss_grads)
+    input_grads, parameter_grads = jax.vmap(backward, in_axes=(None, 0, 0))(params, y_pred, loss_grads)
+    input_grads = jnp.mean(input_grads, axis=0)
+    parameter_grads = jtu.tree_map(lambda x: jnp.mean(x, axis=0), parameter_grads)
     updates, opt_state = optimizer.update(parameter_grads, opt_state, params)
     params = optax.apply_updates(params, updates)
     return loss, params, opt_state
@@ -161,7 +142,8 @@ def validation_loss(y_pred, y_true):
 @jax.jit
 def validate(params, y):
     y0 = y[0, :, :]
-    y_pred = forward(y0, params)
+    y_pred = jax.vmap(forward, in_axes=(0, None))(y0, params)
+    y_pred = jnp.squeeze(y_pred)
     y1 = y[-1, :, :]
     loss = validation_loss(y_pred, y1)
     return loss
@@ -174,12 +156,12 @@ def data_split(y, ratio=0.8):
     return y_train, y_val
 
 
-key, subkey = jax.random.split(key)
-y = generate_data(data_term, data_args, dim, batch_size, subkey, solver, T0, T1, h, saveat)
-y_train, y_val = data_split(y)
 epochs = 100
 for epoch in range(1, epochs + 1):
     try:
+        key, subkey = jax.random.split(key)
+        y = generate_data(data_term, data_args, dim, batch_size, subkey, solver, T0, T1, h, saveat)
+        y_train, y_val = data_split(y)
 
         train_loss, params, opt_state = train(params, opt_state, y_train)
         val_loss = validate(params, y_val)
