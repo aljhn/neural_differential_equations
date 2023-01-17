@@ -20,19 +20,20 @@ def mass_spring_damper(t, y, args):
 
 
 # Generate trajectories by sampling random initial values and integrating those
-def generate_data(data_term, dim, batch_size, key, T0, T1, h, saveat, solver):
+def generate_data(data_term, data_args, dim, batch_size, key, solver, T0, T1, h, saveat):
     y0 = jax.random.ball(key, d=dim, p=2, shape=(batch_size,))
-    solution = diffeqsolve(data_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, saveat=saveat, args=[1, 1, 1], adjoint=NoAdjoint())
+    solution = diffeqsolve(data_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, saveat=saveat, args=data_args, adjoint=NoAdjoint())
     return solution.ys
 
 
-T0 = 0
-T1 = 1
+T0 = 0.0
+T1 = 1.0
 h = 0.01
-saveat = SaveAt(ts=jnp.arange(T0, T1, h))
+saveat = SaveAt(ts=jnp.array([T0, T1]))
 solver = Dopri5()
 
 data_term = ODETerm(mass_spring_damper)
+data_args = [1, 1, 1]
 dim = 2
 batch_size = 200
 
@@ -52,7 +53,7 @@ key, subkey = jax.random.split(key)
 model_def = [2, 50, 50, 2]
 params = model_init(model_def, subkey)
 
-optimizer = optax.adamw(learning_rate=1e-2)
+optimizer = optax.adamw(learning_rate=1e-3)
 opt_state = optimizer.init(params)
 
 
@@ -81,9 +82,9 @@ def model_forward(x, params):
 # Vectorize the forward pass using vmap
 # Can not use a decorator because the in_axes must be specified
 model_forward = jax.vmap(model_forward, in_axes=(0, None))
-    
-model_term = ODETerm(lambda t, y, args: model_forward(y, args[0]))
 
+model_term = ODETerm(lambda t, y, args: model_forward(y, args))
+    
 
 @jax.value_and_grad
 def compute_loss(y_pred, y_true):
@@ -92,7 +93,7 @@ def compute_loss(y_pred, y_true):
 
 # Neural ODE forward pass
 def forward(y0, params):
-    solution = diffeqsolve(model_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, args=[params], adjoint=NoAdjoint())
+    solution = diffeqsolve(model_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, args=params, adjoint=NoAdjoint())
     return solution.ys[-1, :, :]
 
 
@@ -100,7 +101,7 @@ def forward(y0, params):
 # The final vector-jacobian-product is currently not vectorized properly,
 # which is (inefficiently) solved by duplicating and averaging the result
 def augmented_dynamics(t, s, args):
-    params = args[0]
+    params = args
     n = (s.shape[1] - params.shape[0]) // 2
     z = s[:, 0:n]
     a = s[:, n:2*n]
@@ -133,7 +134,7 @@ def backward(params, z_pred, output_grads):
     a1 = output_grads
     dL = jnp.zeros((batch_size, params.shape[0]))
     s0 = jnp.concatenate((z1, a1, dL), axis=1)
-    solution = diffeqsolve(augmented_term, solver, t0=T1, t1=T0, dt0=-h, y0=s0, args=[params], adjoint=NoAdjoint())
+    solution = diffeqsolve(augmented_term, solver, t0=T1, t1=T0, dt0=-h, y0=s0, args=params, adjoint=NoAdjoint())
     augmented_state = solution.ys[-1, :, :]
     input_grads = jnp.mean(augmented_state[:, n:2 * n], axis=0)
     parameter_grads = jnp.mean(augmented_state[:, 2 * n:], axis=0)
@@ -173,12 +174,12 @@ def data_split(y, ratio=0.8):
     return y_train, y_val
 
 
+key, subkey = jax.random.split(key)
+y = generate_data(data_term, data_args, dim, batch_size, subkey, solver, T0, T1, h, saveat)
+y_train, y_val = data_split(y)
 epochs = 100
 for epoch in range(1, epochs + 1):
     try:
-        key, subkey = jax.random.split(key)
-        y = generate_data(data_term, dim, batch_size, subkey, T0, T1, h, saveat, solver)
-        y_train, y_val = data_split(y)
 
         train_loss, params, opt_state = train(params, opt_state, y_train)
         val_loss = validate(params, y_val)
