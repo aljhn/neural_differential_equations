@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import optax
-from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt, NoAdjoint
+import diffrax
 
 
 seed = 42069
@@ -23,17 +23,17 @@ def mass_spring_damper(t, y, args):
 # Generate trajectories by sampling random initial values and integrating those
 def generate_data(data_term, data_args, dim, batch_size, key, solver, T0, T1, h, saveat):
     y0 = jax.random.ball(key, d=dim, p=2, shape=(batch_size,)) * 10
-    solution = diffeqsolve(data_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, saveat=saveat, args=data_args, adjoint=NoAdjoint())
+    solution = diffrax.diffeqsolve(data_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, saveat=saveat, args=data_args, adjoint=diffrax.NoAdjoint())
     return solution.ys
 
 
 T0 = 0.0
 T1 = 1.0
 h = 0.01
-saveat = SaveAt(ts=jnp.array([T0, T1]))
-solver = Dopri5()
+saveat = diffrax.SaveAt(ts=jnp.array([T0, T1]))
+solver = diffrax.Dopri5()
 
-data_term = ODETerm(mass_spring_damper)
+data_term = diffrax.ODETerm(mass_spring_damper)
 data_args = [1, 1, 1]
 dim = 2
 batch_size = 200
@@ -75,13 +75,13 @@ def model_forward(x, params):
     return x
 
 
-model_term = ODETerm(lambda t, y, args: model_forward(y, args))
+model_term = diffrax.ODETerm(lambda t, y, args: model_forward(y, args))
     
 
 # Neural ODE forward pass
 # Use the input as an initial value and integrate it using the model as the dynamics
 def forward(y0, params):
-    solution = diffeqsolve(model_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, args=params, adjoint=NoAdjoint())
+    solution = diffrax.diffeqsolve(model_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, args=params, adjoint=diffrax.NoAdjoint())
     return solution.ys
 
 
@@ -97,7 +97,7 @@ def augmented_dynamics(t, s, params):
     return ds
 
 
-augmented_term = ODETerm(augmented_dynamics)
+augmented_term = diffrax.ODETerm(augmented_dynamics)
 
 
 # Neural ODE backward pass
@@ -108,7 +108,7 @@ def backward(params, z_pred, output_grads):
     a1 = output_grads
     dL = jtu.tree_map(lambda x: jnp.zeros_like(x), params)
     s1 = (z1, a1, dL)
-    solution = diffeqsolve(augmented_term, solver, t0=T1, t1=T0, dt0=-h, y0=s1, args=params, adjoint=NoAdjoint())
+    solution = diffrax.diffeqsolve(augmented_term, solver, t0=T1, t1=T0, dt0=-h, y0=s1, args=params, adjoint=diffrax.NoAdjoint())
     z0, input_grads, parameter_grads = solution.ys
     input_grads = input_grads[0, :]
     parameter_grads = jtu.tree_map(lambda x: jnp.squeeze(x), parameter_grads)
@@ -116,7 +116,7 @@ def backward(params, z_pred, output_grads):
 
 
 @jax.value_and_grad
-def compute_loss(y_pred, y_true):
+def train_loss(y_pred, y_true):
     return jnp.mean(optax.l2_loss(y_pred, y_true))
 
 
@@ -127,7 +127,7 @@ def train(params, opt_state, y):
     y_pred = jax.vmap(forward, in_axes=(0, None))(y0, params)
     y_pred = jnp.squeeze(y_pred)
     y1 = y[-1, :, :]
-    loss, loss_grads = compute_loss(y_pred, y1)
+    loss, loss_grads = train_loss(y_pred, y1)
     input_grads, parameter_grads = jax.vmap(backward, in_axes=(None, 0, 0))(params, y_pred, loss_grads)
     input_grads = jnp.mean(input_grads, axis=0)
     parameter_grads = jtu.tree_map(lambda x: jnp.mean(x, axis=0), parameter_grads)
@@ -155,21 +155,6 @@ def data_split(y, ratio=0.8):
     y_train = y[:, :int(batch_size * ratio), :]
     y_val = y[:, int(batch_size * ratio):, :]
     return y_train, y_val
-
-
-epochs = 100
-for epoch in range(1, epochs + 1):
-    try:
-        key, subkey = jax.random.split(key)
-        y = generate_data(data_term, data_args, dim, batch_size, subkey, solver, T0, T1, h, saveat)
-        y_train, y_val = data_split(y)
-
-        train_loss, params, opt_state = train(params, opt_state, y_train)
-        val_loss = validate(params, y_val)
-
-        print(f"Epoch: {epoch:3d}, Train Loss: {train_loss.item():.4f}, Val Loss: {val_loss.item():.4f}")
-    except KeyboardInterrupt:
-        break
 
 
 def plot_vector_field(params):
@@ -202,5 +187,20 @@ def plot_vector_field(params):
     plt.figure()
     plt.streamplot(X1, X2, Y1, Y2, density=1, linewidth=None, color="#A23BEC") 
     plt.show()
+
+
+epochs = 100
+for epoch in range(1, epochs + 1):
+    try:
+        key, subkey = jax.random.split(key)
+        y = generate_data(data_term, data_args, dim, batch_size, subkey, solver, T0, T1, h, saveat)
+        y_train, y_val = data_split(y)
+
+        train_loss, params, opt_state = train(params, opt_state, y_train)
+        val_loss = validate(params, y_val)
+
+        print(f"Epoch: {epoch:3d}, Train Loss: {train_loss.item():.4f}, Val Loss: {val_loss.item():.4f}")
+    except KeyboardInterrupt:
+        break
 
 plot_vector_field(params)
