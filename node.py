@@ -17,12 +17,12 @@ key = jax.random.PRNGKey(seed)
 def mass_spring_damper(t, y, args):
     m, d, k = args
     A = jnp.array([[0, 1], [-k / m, -d / m]])
-    return y @ A
+    return y @ A.T
 
 
 # Generate trajectories by sampling random initial values and integrating those
 def generate_data(data_term, data_args, dim, batch_size, key, solver, T0, T1, h, saveat):
-    y0 = jax.random.ball(key, d=dim, p=2, shape=(batch_size,))
+    y0 = jax.random.ball(key, d=dim, p=2, shape=(batch_size,)) * 10
     solution = diffeqsolve(data_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, saveat=saveat, args=data_args, adjoint=NoAdjoint())
     return solution.ys
 
@@ -54,11 +54,11 @@ def model_init(model_def, key):
 
 
 key, subkey = jax.random.split(key)
-model_def = [2, 50, 50, 2]
+model_def = [2, 50, 100, 50, 2]
 params = model_init(model_def, subkey)
 
 
-optimizer = optax.adamw(learning_rate=1e-2)
+optimizer = optax.adamw(learning_rate=1e-3)
 opt_state = optimizer.init(params)
 
 
@@ -66,11 +66,11 @@ opt_state = optimizer.init(params)
 # The forward pass is computed as a standard fully connected neural network
 # The sigmoid activation function is applied at every layer except the last
 def model_forward(x, params):
-    for i in range(len(model_def) - 1):
+    for i in range(len(params)):
         weights = params[i]["weights"]
         bias = params[i]["bias"]
         x = x @ weights + bias
-        if i < len(model_def) - 1:
+        if i < len(params) - 1:
             x = jax.nn.sigmoid(x)
     return x
 
@@ -79,6 +79,7 @@ model_term = ODETerm(lambda t, y, args: model_forward(y, args))
     
 
 # Neural ODE forward pass
+# Use the input as an initial value and integrate it using the model as the dynamics
 def forward(y0, params):
     solution = diffeqsolve(model_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, args=params, adjoint=NoAdjoint())
     return solution.ys
@@ -183,6 +184,7 @@ def plot_vector_field(params):
     
     XX = jnp.asarray(X)
     YY = model_forward(XX, params)
+    # YY = mass_spring_damper(None, XX, [1, 1, 1])
     Y = np.asarray(YY)
 
     X1 = np.zeros((n, n))
@@ -198,7 +200,7 @@ def plot_vector_field(params):
             Y2[i, j] = Y[i + n * j, 1]
 
     plt.figure()
-    plt.streamplot(X1, X2, Y1, Y2, density=1, linewidth=None, color="#A23BEC")
+    plt.streamplot(X1, X2, Y1, Y2, density=1, linewidth=None, color="#A23BEC") 
     plt.show()
 
-# plot_vector_field(params)
+plot_vector_field(params)
