@@ -1,6 +1,7 @@
 import random
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
@@ -23,7 +24,7 @@ def mass_spring_damper(t, y, args):
 # Generate trajectories by sampling random initial values and integrating those
 def generate_data(data_term, data_args, dim, batch_size, key, solver, T0, T1, h, saveat):
     y0 = jax.random.ball(key, d=dim, p=2, shape=(batch_size,)) * 10
-    solution = diffrax.diffeqsolve(data_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, saveat=saveat, args=data_args, adjoint=diffrax.NoAdjoint())
+    solution = diffrax.diffeqsolve(data_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, saveat=saveat, args=data_args, max_steps=None, adjoint=diffrax.RecursiveCheckpointAdjoint(checkpoints=None))
     return solution.ys
 
 
@@ -36,7 +37,7 @@ solver = diffrax.Dopri5()
 data_term = diffrax.ODETerm(mass_spring_damper)
 data_args = [1, 1, 1]
 dim = 2
-batch_size = 200
+batch_size = 100
 
 
 # Define models as a list of nodes per layer
@@ -54,24 +55,24 @@ def model_init(model_def, key):
 
 
 key, subkey = jax.random.split(key)
-model_def = [2, 50, 100, 50, 2]
+model_def = [2, 50, 50, 2]
 params = model_init(model_def, subkey)
 
 
-optimizer = optax.adamw(learning_rate=1e-3)
+optimizer = optax.adam(learning_rate=1e-3)
 opt_state = optimizer.init(params)
 
 
 # Use the model definition to extract the individual parameters from the total vector
 # The forward pass is computed as a standard fully connected neural network
-# The sigmoid activation function is applied at every layer except the last
+# The tanh activation function is applied at every layer except the last
 def model_forward(x, params):
     for i in range(len(params)):
         weights = params[i]["weights"]
         bias = params[i]["bias"]
         x = x @ weights + bias
         if i < len(params) - 1:
-            x = jax.nn.sigmoid(x)
+            x = jnp.tanh(x)
     return x
 
 
@@ -79,9 +80,11 @@ model_term = diffrax.ODETerm(lambda t, y, args: model_forward(y, args))
     
 
 # Neural ODE forward pass
-# Use the input as an initial value and integrate it using the model as the dynamics
+# Use the input as an initial value and integrate it using the model as the dynamics.
+# Using the parameters max_steps=None and adjoint=diffrax.RecursiveCheckpointAdjoint(checkpoints=None)
+# means that diffrax disables automatic differentiation, as this is implemented manually with the augmented dynamics
 def forward(y0, params):
-    solution = diffrax.diffeqsolve(model_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, args=params, adjoint=diffrax.NoAdjoint())
+    solution = diffrax.diffeqsolve(model_term, solver, t0=T0, t1=T1, dt0=h, y0=y0, args=params, max_steps=None, adjoint=diffrax.RecursiveCheckpointAdjoint(checkpoints=None))
     return solution.ys
 
 
@@ -102,13 +105,14 @@ augmented_term = diffrax.ODETerm(augmented_dynamics)
 
 # Neural ODE backward pass
 # Returns gradients from the output of the Neural ODE to both the parameters and the input
+# The augmented state to be integrated is set as a tuple of three jax arrays
 # Algorithm 1 from https://arxiv.org/abs/1806.07366
 def backward(params, z_pred, output_grads):
     z1 = z_pred
     a1 = output_grads
     dL = jtu.tree_map(lambda x: jnp.zeros_like(x), params)
     s1 = (z1, a1, dL)
-    solution = diffrax.diffeqsolve(augmented_term, solver, t0=T1, t1=T0, dt0=-h, y0=s1, args=params, adjoint=diffrax.NoAdjoint())
+    solution = diffrax.diffeqsolve(augmented_term, solver, t0=T1, t1=T0, dt0=-h, y0=s1, args=params, max_steps=None, adjoint=diffrax.RecursiveCheckpointAdjoint(checkpoints=None))
     z0, input_grads, parameter_grads = solution.ys
     input_grads = input_grads[0, :]
     parameter_grads = jtu.tree_map(lambda x: jnp.squeeze(x), parameter_grads)
@@ -158,39 +162,29 @@ def data_split(y, ratio=0.8):
 
 
 def plot_vector_field(params):
-    x = np.arange(-10, 10, 0.1)
-    n = x.shape[0]
+    X = jnp.arange(-10, 10, 0.1)
+    X1, X2 = jnp.meshgrid(X, X, indexing="xy")
+    XX = jnp.stack((X1.flatten(), X2.flatten()), axis=1)
 
-    X = np.zeros((n * n, dim))
-    for i in range(n):
-        for j in range(n):
-            X[i + n * j, 0] = x[j]
-            X[i + n * j, 1] = x[i]
-    
-    XX = jnp.asarray(X)
     YY = model_forward(XX, params)
     # YY = mass_spring_damper(None, XX, [1, 1, 1])
-    Y = np.asarray(YY)
 
-    X1 = np.zeros((n, n))
-    X2 = np.zeros((n, n))
-    Y1 = np.zeros((n, n))
-    Y2 = np.zeros((n, n))
+    Y1 = YY[:, 0].reshape(X1.shape)
+    Y2 = YY[:, 1].reshape(X2.shape)
 
-    for i in range(n):
-        for j in range(n):
-            X1[i, j] = X[i + n * j, 0]
-            X2[i, j] = X[i + n * j, 1]
-            Y1[i, j] = Y[i + n * j, 0]
-            Y2[i, j] = Y[i + n * j, 1]
+    X1 = np.asarray(X1)
+    X2 = np.asarray(X2)
+    Y1 = np.asarray(Y1)
+    Y2 = np.asarray(Y2)
 
     plt.figure()
     plt.streamplot(X1, X2, Y1, Y2, density=1, linewidth=None, color="#A23BEC") 
     plt.show()
 
 
-epochs = 100
-for epoch in range(1, epochs + 1):
+epochs = 0
+pbar = tqdm(range(1, epochs + 1))
+for epoch in pbar:
     try:
         key, subkey = jax.random.split(key)
         y = generate_data(data_term, data_args, dim, batch_size, subkey, solver, T0, T1, h, saveat)
@@ -199,7 +193,7 @@ for epoch in range(1, epochs + 1):
         train_loss, params, opt_state = train(params, opt_state, y_train)
         val_loss = validate(params, y_val)
 
-        print(f"Epoch: {epoch:3d}, Train Loss: {train_loss.item():.4f}, Val Loss: {val_loss.item():.4f}")
+        pbar.set_postfix({"TL": f"{train_loss.item():.4f}", "VL": f"{val_loss.item():.4f}"})
     except KeyboardInterrupt:
         break
 

@@ -5,7 +5,10 @@
 
 ## Neural Ordinary Differential Equations
 
-Origin paper by [Chen et al. \[2018\]](https://arxiv.org/abs/1806.07366).
+Original paper by [Chen et al. \[2018\]](https://arxiv.org/abs/1806.07366).
+
+Diffrax has an existing implementation of the adjoint method, but this part of Diffrax is not used,
+only the numerical integration as it supports PyTrees unlike SciPy which only supports numpy arrays.
 
 ## Augmented Neural ODEs
 
