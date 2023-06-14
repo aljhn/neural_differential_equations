@@ -8,7 +8,7 @@
 Original paper by [Chen et al. \[2018\]](https://arxiv.org/abs/1806.07366).
 
 Diffrax has an existing implementation of the adjoint method, but this part of Diffrax is not used,
-only the numerical integration as it supports PyTrees unlike SciPy which only supports numpy arrays.
+only the numerical integration as it supports arbitrary PyTrees unlike SciPy which only supports numpy arrays.
 
 ## Augmented Neural ODEs
 
@@ -33,3 +33,7 @@ only the numerical integration as it supports PyTrees unlike SciPy which only su
 ## Lagrangian Neural Networks
 
 [Cranmer et al. \[2020\]](https://arxiv.org/abs/2003.04630).
+
+## Correcting auto-differentiation in neural-ODE training
+
+[Xu et al. \[2023\]](https://arxiv.org/abs/2306.02192)
